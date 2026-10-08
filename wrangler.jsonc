@@ -1,0 +1,13 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "anixweb-server",
+  "main": "src/worker.ts",
+  "compatibility_date": "2026-10-07",
+  "vars": { "ALLOWED_ORIGINS": "https://imnottimaq.github.io,http://localhost:5173,http://127.0.0.1:5173" },
+  "durable_objects": { "bindings": [
+    { "name": "ROOMS", "class_name": "RoomObject" },
+    { "name": "DIRECTORY", "class_name": "RoomDirectory" }
+  ] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["RoomObject", "RoomDirectory"] }],
+  "observability": { "enabled": false }
+}

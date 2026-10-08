@@ -1,0 +1,1 @@
+SESSION_SECRET="replace-with-a-random-secret-of-at-least-32-characters"
