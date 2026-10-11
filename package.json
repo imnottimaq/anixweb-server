@@ -8,8 +8,10 @@
     "build": "tsc --noEmit && wrangler deploy --dry-run --outdir dist",
     "typecheck": "tsc --noEmit",
     "test": "node --experimental-strip-types --test tests/*.test.ts",
-    "test:browser": "node --test tests/browser.mjs",
-    "sync:protocol": "node scripts/sync-protocol.mjs"
+    "test:browser": "node --test tests/browser.mjs tests/socialBrowser.mjs tests/attachmentsBrowser.mjs",
+    "test:social:browser": "node --test tests/socialBrowser.mjs",
+    "sync:protocol": "node scripts/sync-protocol.mjs",
+    "test:attachments:browser": "node --test tests/attachmentsBrowser.mjs"
   },
   "overrides": {
     "sharp": "^0.35.5"

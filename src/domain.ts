@@ -1,11 +1,22 @@
-import { EMPTY_TTL_MS, WAIT_MS, type Profile, type RoomCommand, type RoomParticipant, type WatchRoomState, type RoomVisibility } from '../protocol/index.ts';
+import {
+    EMPTY_TTL_MS,
+    WAIT_MS,
+    MAX_CHAT_HISTORY,
+    type Profile,
+    type RoomCommand,
+    type RoomParticipant,
+    type WatchRoomState,
+    type RoomVisibility,
+    type RoomChatMessage,
+    type RoomReaction,
+} from '../protocol/index.ts';
 
 export class DomainError extends Error {
     readonly code: string;
     constructor(code: string) { super(code); this.code = code; }
 }
 export type EngineData = { state: WatchRoomState; commands: Array<{ key: string; at: number }> };
-type CommandResult = { duplicate: boolean; kicked?: number; left?: number };
+export type CommandResult = { duplicate: boolean; kicked?: number; left?: number; reaction?: RoomReaction; closed?: boolean };
 
 export function playbackPosition(state: WatchRoomState, now: number): number {
     const p = state.playback;
@@ -21,6 +32,7 @@ export class RoomEngine {
 
     constructor(data: EngineData, random: () => number = () => crypto.getRandomValues(new Uint32Array(1))[0] / 0x1_0000_0000) {
         this.state = structuredClone(data.state);
+        this.state.chat = Array.isArray(data.state.chat) ? structuredClone(data.state.chat) : [];
         this.commands = structuredClone(data.commands);
         this.random = random;
     }
@@ -34,11 +46,29 @@ export class RoomEngine {
                 barrier: null, participants: [{ ...input.host, canControl: true, connected: false,
                     viewing: false, status: 'idle', readyEpoch: null, excludedEpoch: null, disconnectedAt: now, error: null }],
                 emptySince: now, closed: false,
+                chat: [],
             }, commands: [],
         });
     }
     snapshot(): WatchRoomState { return structuredClone(this.state); }
     exportData(): EngineData { return { state: this.snapshot(), commands: structuredClone(this.commands) }; }
+    addChatMessage(message: RoomChatMessage) {
+        this.open();
+        if (!this.state.chat) this.state.chat = [];
+        this.state.chat.push(structuredClone(message));
+        if (this.state.chat.length > MAX_CHAT_HISTORY) {
+            this.state.chat = this.state.chat.slice(-MAX_CHAT_HISTORY);
+        }
+        this.bump();
+    }
+    removeChatMessage(messageId: string) {
+        if (!this.state.chat) return;
+        const index = this.state.chat.findIndex(m => m.id === messageId);
+        if (index !== -1) {
+            this.state.chat.splice(index, 1);
+            this.state.revision--;
+        }
+    }
     private open() { if (this.state.closed) throw new DomainError('ROOM_CLOSED'); }
     private freeze(now: number) {
         this.state.playback.position = playbackPosition(this.state, now);
@@ -115,17 +145,64 @@ export class RoomEngine {
         this.settle(now);
         this.bump();
     }
+    isDuplicate(profileId: number, commandId: string): boolean {
+        return this.commands.some(c => c.key === `${profileId}:${commandId}`);
+    }
     command(profileId: number, command: RoomCommand, now: number): CommandResult {
         this.open();
         const actor = this.state.participants.find(p => p.profileId === profileId && p.connected);
         if (!actor) throw new DomainError('NOT_JOINED');
         const key = `${profileId}:${command.commandId}`;
         if (this.commands.some(c => c.key === key)) return { duplicate: true };
-        if (command.mediaVersion !== this.state.mediaVersion) throw new DomainError('STALE_MEDIA');
+        const isSocial = command.type === 'chat_message' || command.type === 'reaction';
+        const ignoresMediaVersion = isSocial || command.type === 'close_room';
+        if (!ignoresMediaVersion && command.mediaVersion !== this.state.mediaVersion) throw new DomainError('STALE_MEDIA');
         const manages = ['grant_control', 'revoke_control', 'kick', 'transfer_host'].includes(command.type);
         const controls = ['set_media', 'play', 'pause', 'seek', 'set_rate'].includes(command.type);
         if (manages && profileId !== this.state.hostId) throw new DomainError('HOST_REQUIRED');
         if (controls && !actor.canControl && profileId !== this.state.hostId) throw new DomainError('CONTROL_REQUIRED');
+        if (command.type === 'close_room') {
+            if (profileId !== this.state.hostId) throw new DomainError('HOST_REQUIRED');
+            this.freeze(now);
+            this.state.closed = true;
+            this.state.barrier = null;
+            this.commands = this.commands.filter(c => now - c.at < EMPTY_TTL_MS).slice(-511);
+            this.commands.push({ key, at: now });
+            this.bump();
+            return { duplicate: false, closed: true };
+        }
+        if (command.type === 'chat_message') {
+            const message: RoomChatMessage = {
+                id: crypto.randomUUID(),
+                profileId: actor.profileId,
+                login: actor.login,
+                avatar: actor.avatar,
+                text: command.text,
+                createdAt: now,
+            };
+            if (!this.state.chat) this.state.chat = [];
+            this.state.chat.push(message);
+            if (this.state.chat.length > MAX_CHAT_HISTORY) {
+                this.state.chat = this.state.chat.slice(-MAX_CHAT_HISTORY);
+            }
+            this.commands = this.commands.filter(c => now - c.at < EMPTY_TTL_MS).slice(-511);
+            this.commands.push({ key, at: now });
+            this.bump();
+            return { duplicate: false };
+        }
+        if (command.type === 'reaction') {
+            const reaction: RoomReaction = {
+                id: crypto.randomUUID(),
+                profileId: actor.profileId,
+                login: actor.login,
+                avatar: actor.avatar,
+                emoji: command.emoji,
+                createdAt: now,
+            };
+            this.commands = this.commands.filter(c => now - c.at < EMPTY_TTL_MS).slice(-511);
+            this.commands.push({ key, at: now });
+            return { duplicate: false, reaction };
+        }
         // Snapshot the running anchor before any mutation. Presence/ready updates
         // must not accidentally restart the clock at an older position.
         const runningPosition = playbackPosition(this.state, now);

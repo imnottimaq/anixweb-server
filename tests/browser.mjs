@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createRequire } from 'node:module';
+import { createServer as createNetServer } from 'node:net';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { readFile, writeFile, mkdir } from 'node:fs/promises';
+import { readFile, writeFile, mkdir, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, dirname, basename, resolve } from 'node:path';
 import { build } from 'esbuild';
 import { Miniflare, convertV4MiniflareOptions } from 'miniflare';
 
@@ -12,12 +13,24 @@ const clientRoot = fileURLToPath(new URL('../../anixweb/', import.meta.url));
 const requireClient = createRequire(join(clientRoot, 'package.json'));
 const { chromium } = requireClient('@playwright/test');
 const { createServer } = await import(pathToFileURL(requireClient.resolve('vite')).href);
-const origin = 'http://127.0.0.1:5173';
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 async function waitFor(fn, label, timeout = 15000) {
     const start = Date.now();
     while (Date.now() - start < timeout) { if (await fn()) return; await delay(100); }
     throw new Error(`Timed out: ${label}`);
+}
+async function getFreePort() {
+    return new Promise((resolve, reject) => {
+        const srv = createNetServer();
+        srv.listen(0, '127.0.0.1', () => {
+            const port = srv.address().port;
+            srv.close(err => {
+                if (err) reject(err);
+                else resolve(port);
+            });
+        });
+        srv.on('error', reject);
+    });
 }
 async function fixtureVideo() {
     const directory = join(tmpdir(), 'anixweb-browser-fixtures');
@@ -50,10 +63,13 @@ async function fixtureHls() {
     return files;
 }
 
-test('two real browsers: seven-second wait, late catch-up, room controls, navigation and host transfer', { timeout: 120000 }, async () => {
-    let mf, vite, browser, releaseGuest, hostPage;
+test('two real browsers: seven-second wait, late catch-up, room controls, navigation and host transfer', { timeout: 150000 }, async () => {
+    let mf, vite, browser, releaseGuest, hostPage, cacheDirectory;
     const failures = [];
     try {
+        const port = await getFreePort();
+        cacheDirectory = await mkdtemp(join(tmpdir(), 'anixweb-playback-vite-'));
+        const origin = `http://127.0.0.1:${port}`;
         const video = await fixtureVideo();
         const hls = await fixtureHls();
         const bundle = await build({ entryPoints: ['src/worker.ts'], bundle: true, write: false, format: 'esm', platform: 'browser' });
@@ -81,12 +97,15 @@ test('two real browsers: seven-second wait, late catch-up, room controls, naviga
         console.log('Browser fixture Worker:', backend, (await fetch(backend + '/api/v2/rooms')).status);
         process.env.VITE_ROOM_SERVER_URL = backend;
         process.env.VITE_PROXY_SERVER_URL = backend;
-        vite = await createServer({ root: clientRoot, define: {
+        vite = await createServer({ root: clientRoot, cacheDir: cacheDirectory, define: {
             'import.meta.env.VITE_ROOM_SERVER_URL': JSON.stringify(backend),
             'import.meta.env.VITE_PROXY_SERVER_URL': JSON.stringify(backend),
-        }, server: { host: '127.0.0.1', port: 5173, strictPort: true },
+        }, server: { host: '127.0.0.1', port, strictPort: true },
             plugins: [{ name: 'real-video-fixture', configureServer(server) {
                 server.middlewares.use((request, response, next) => {
+                    if (request.url?.startsWith('/anixweb/')) {
+                        request.url = request.url.replace(/^\/anixweb\//, '/');
+                    }
                     if (request.url?.startsWith('/__fixtures__/hls/')) {
                         const name = new URL(request.url, origin).pathname.split('/').at(-1);
                         const bytes = hls.get(name);
@@ -170,8 +189,14 @@ test('two real browsers: seven-second wait, late catch-up, room controls, naviga
             const { getRoomServerUrl } = await import('/src/shared/watchRoom.ts');
             return { base: getRoomServerUrl(), agent: navigator.userAgent };
         }));
-        await h.page.locator('form input').first().fill('Browser test room');
-        await h.page.locator('form button').first().click();
+
+        // Current UI: Click Create room button on lobby page
+        await h.page.getByRole('button', { name: 'Create room', exact: true }).click();
+        const createDialog = h.page.getByRole('dialog', { name: 'New room' });
+        await createDialog.waitFor();
+        await createDialog.getByRole('textbox').fill('Browser test room');
+        await createDialog.getByRole('button', { name: 'Create room', exact: true }).click();
+
         await waitFor(() => h.state()?.participants.some(p => p.profileId === 1 && p.connected), 'host connected');
         const roomId = h.state().roomId, code = h.state().joinCode;
         console.log('Browser fixture: host created and joined a private room.');
@@ -193,7 +218,7 @@ test('two real browsers: seven-second wait, late catch-up, room controls, naviga
         assert.equal(h.state().participants.find(p => p.profileId === 2).connected, true);
         assert.equal(h.state().participants.find(p => p.profileId === 2).excludedEpoch, h.state().syncEpoch);
         await waitFor(() => h.page.locator('video').evaluate(v => !v.paused && v.currentTime > .5), 'real host playback advances');
-        console.log('Browser fixture:7s timeout resumed without kicking the guest.');
+        console.log('Browser fixture: 7s timeout resumed without kicking the guest.');
         holdGuest = false; releaseGuest();
         await waitFor(() => g.state()?.participants.find(p => p.profileId === 2)?.status === 'ready', 'late viewer catches up');
         await waitFor(async () => {
@@ -273,7 +298,94 @@ test('two real browsers: seven-second wait, late catch-up, room controls, naviga
         assert.deepEqual(failures, [], 'no uncaught browser errors');
         await mkdir('test-results', { recursive: true });
         await h.page.screenshot({ path: 'test-results/room-browser.png', fullPage: true });
-        console.log('Real MP4/HLS, two independent Chromium contexts,7s barrier,late catch-up,paused quality switch,private refresh,UI pause,navigation and host transfer passed.');
+        console.log('Real MP4/HLS, two independent Chromium contexts, 7s barrier, late catch-up, paused quality switch, private refresh, UI pause, navigation and host transfer passed.');
+
+        // -------------------------------------------------------------------------
+        // Isolated Browser Check 1: Malformed Settings Import
+        // -------------------------------------------------------------------------
+        console.log('Browser fixture: checking malformed settings import...');
+        {
+            const settingsContext = await browser.newContext();
+            const initialSettings = { appearance: { language: 'english', theme: 'dark' }, player: { volume: 77, autoplay: false } };
+            await settingsContext.addInitScript(({ initialSettings }) => {
+                localStorage.setItem('onboarded', 'true');
+                localStorage.setItem('app_settings', JSON.stringify(initialSettings));
+            }, { initialSettings });
+            const settingsPage = await settingsContext.newPage();
+            const settingsErrors = [];
+            settingsPage.on('pageerror', err => settingsErrors.push(err.message));
+            await settingsPage.goto(`${origin}/settings`);
+
+            await settingsPage.getByRole('tab', { name: /Data/i }).click();
+            await settingsPage.getByTestId('settings-backup-file').setInputFiles({
+                name: 'malformed.json',
+                mimeType: 'application/json',
+                buffer: Buffer.from('{ malformed: "invalid json content" ')
+            });
+
+            const alert = settingsPage.getByRole('alert').filter({ hasText: 'Failed to import settings' });
+            await alert.waitFor({ timeout: 5000 });
+            assert.ok(await alert.isVisible(), 'error alert is shown on malformed import');
+
+            const preserved = await settingsPage.evaluate(() => JSON.parse(localStorage.getItem('app_settings') || '{}'));
+            assert.equal(preserved.player?.volume, 77, 'volume is preserved');
+            assert.equal(preserved.appearance?.theme, 'dark', 'theme is preserved');
+            assert.deepEqual(settingsErrors, [], 'no uncaught page errors on malformed import');
+            await settingsPage.close();
+            await settingsContext.close();
+            console.log('Browser fixture: malformed settings import rejected without crash or overwrite.');
+        }
+
+        // -------------------------------------------------------------------------
+        // Isolated Browser Check 2: Root and Subpath PWA Assets
+        // -------------------------------------------------------------------------
+        console.log('Browser fixture: checking root and subpath PWA assets...');
+        {
+            const pwaContext = await browser.newContext();
+            const pwaPage = await pwaContext.newPage();
+
+            // Root manifest
+            const rootManifestRes = await pwaPage.request.get(`${origin}/manifest.webmanifest`);
+            assert.equal(rootManifestRes.status(), 200, 'root manifest 200');
+            const manifestJson = await rootManifestRes.json();
+            assert.equal(manifestJson.start_url, './', 'manifest start_url relative');
+            assert.equal(manifestJson.scope, './', 'manifest scope relative');
+
+            // Root sw
+            const rootSwRes = await pwaPage.request.get(`${origin}/sw.js`);
+            assert.equal(rootSwRes.status(), 200, 'root sw.js 200');
+            const swText = await rootSwRes.text();
+            assert.ok(swText.includes('anixweb-v2-'), 'sw has isolated cache name');
+
+            // Root icons
+            for (const iconPath of ['icons/icon.svg', 'icons/icon-192.png', 'icons/icon-512.png', 'icons/icon-maskable-512.png', 'icons/apple-touch-icon.png']) {
+                const res = await pwaPage.request.get(`${origin}/${iconPath}`);
+                assert.equal(res.status(), 200, `root ${iconPath} 200`);
+                assert.ok((await res.body()).length > 0, `root ${iconPath} non-empty`);
+            }
+
+            // Subpath PWA asset serving & resolution
+            const subManifestRes = await pwaPage.request.get(`${origin}/anixweb/manifest.webmanifest`);
+            assert.equal(subManifestRes.status(), 200, 'subpath manifest 200');
+
+            const subSwRes = await pwaPage.request.get(`${origin}/anixweb/sw.js`);
+            assert.equal(subSwRes.status(), 200, 'subpath sw.js 200');
+
+            const subIconRes = await pwaPage.request.get(`${origin}/anixweb/icons/icon-192.png`);
+            assert.equal(subIconRes.status(), 200, 'subpath icon-192 200');
+
+            // Check URL resolution under subpath
+            const subpathManifestUrl = `${origin}/anixweb/manifest.webmanifest`;
+            const resolvedStartUrl = new URL(manifestJson.start_url, subpathManifestUrl).href;
+            assert.equal(resolvedStartUrl, `${origin}/anixweb/`, 'subpath start_url resolves to subpath base');
+            const resolvedIconUrl = new URL(manifestJson.icons[0].src, subpathManifestUrl).href;
+            assert.equal(resolvedIconUrl, `${origin}/anixweb/icons/icon-192.png`, 'subpath icon resolves to subpath');
+
+            await pwaPage.close();
+            await pwaContext.close();
+            console.log('Browser fixture: root and subpath PWA assets verified.');
+        }
+
     } catch (error) {
         if (hostPage && !hostPage.isClosed()) {
             console.log('Browser diagnostic:', await hostPage.locator('body').innerText());
@@ -284,5 +396,8 @@ test('two real browsers: seven-second wait, late catch-up, room controls, naviga
         throw error;
     } finally {
         releaseGuest?.(); await browser?.close(); await vite?.close(); await mf?.dispose();
+        if (cacheDirectory && resolve(dirname(cacheDirectory)) === resolve(tmpdir()) && basename(cacheDirectory).startsWith('anixweb-playback-vite-')) {
+            await rm(cacheDirectory, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+        }
     }
 });

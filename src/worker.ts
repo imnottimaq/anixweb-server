@@ -1,6 +1,8 @@
 import { authenticate, HttpError, signSession, verifySession } from './auth.ts';
 import { businessLog } from './logging.ts';
 import { handleProxyRequest } from './proxy.ts';
+import { MAX_ATTACHMENT_BYTES } from '../protocol/index.ts';
+import { readBoundedStream } from './attachments.ts';
 export { RoomObject, RoomDirectory } from './objects.ts';
 export interface Env {
   ROOMS: DurableObjectNamespace; DIRECTORY: DurableObjectNamespace;
@@ -38,7 +40,7 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const origin = request.headers.get('Origin');
     const allowed = (env.ALLOWED_ORIGINS ?? '').split(',').map(x => x.trim()).filter(Boolean);
-    const cors: Record<string, string> = origin && allowed.includes(origin) ? { 'Access-Control-Allow-Origin': origin, Vary: 'Origin', 'Access-Control-Allow-Headers': 'Authorization, Content-Type', 'Access-Control-Allow-Methods': 'GET, POST, OPTIONS' } : {};
+    const cors: Record<string, string> = origin && allowed.includes(origin) ? { 'Access-Control-Allow-Origin': origin, Vary: 'Origin', 'Access-Control-Allow-Headers': 'Authorization, Content-Type, X-Attachment-Kind, X-Attachment-Name, X-Attachment-Duration, X-Attachment-Text, X-Attachment-Upload-Id', 'Access-Control-Allow-Methods': 'GET, POST, OPTIONS' } : {};
     try {
       if (origin && !allowed.includes(origin)) throw new HttpError(403, 'ORIGIN_FORBIDDEN');
       const url = new URL(request.url), path = url.pathname;
@@ -83,6 +85,62 @@ export default {
           businessLog('http_rejected', { code: failure.code, status: response.status });
         }
         return response;
+      } else if (/^\/api\/v2\/rooms\/[a-f0-9-]{36}\/attachments$/.test(path) && request.method === 'POST') {
+        const roomId = path.split('/')[4]!;
+        if (Number(request.headers.get('Content-Length')) > MAX_ATTACHMENT_BYTES) {
+          // Drain without retaining bytes before rejecting. An early HTTP
+          // response can otherwise reset an upload still being sent by the client.
+          await readBoundedStream(request.body, 0).catch(() => {});
+          throw new HttpError(413, 'BODY_TOO_LARGE');
+        }
+        const profile = await verifySession(request, env);
+        const kind = request.headers.get('X-Attachment-Kind');
+        if (kind !== 'image' && kind !== 'voice') throw new HttpError(400, 'INVALID_KIND');
+        const uploadId = request.headers.get('X-Attachment-Upload-Id');
+        if (!uploadId || uploadId.length > 80) throw new HttpError(400, 'INVALID_UPLOAD_ID');
+
+        const room = env.ROOMS.get(env.ROOMS.idFromName(roomId));
+        await internal(room, '/attachment-precheck', { profileId: profile.profileId });
+
+        const bytes = await readBoundedStream(request.body, MAX_ATTACHMENT_BYTES);
+
+        const commitHeaders = new Headers();
+        commitHeaders.set('X-Profile', JSON.stringify(profile));
+        commitHeaders.set('X-Attachment-Kind', kind);
+        commitHeaders.set('X-Attachment-Upload-Id', uploadId);
+        commitHeaders.set('X-Attachment-Name', request.headers.get('X-Attachment-Name') ?? '');
+        if (request.headers.get('X-Attachment-Duration')) commitHeaders.set('X-Attachment-Duration', request.headers.get('X-Attachment-Duration')!);
+        if (request.headers.get('X-Attachment-Text')) commitHeaders.set('X-Attachment-Text', request.headers.get('X-Attachment-Text')!);
+        if (request.headers.get('Content-Type')) commitHeaders.set('Content-Type', request.headers.get('Content-Type')!);
+
+        const commitResp = await room.fetch(new Request('https://internal/attachment-commit', {
+          method: 'POST',
+          headers: commitHeaders,
+          body: bytes,
+        }));
+        if (!commitResp.ok) {
+          const failure = await commitResp.json() as { code: string };
+          throw new HttpError(commitResp.status, failure.code);
+        }
+        response = commitResp;
+      } else if (/^\/api\/v2\/rooms\/[a-f0-9-]{36}\/attachments\/[a-f0-9-]{36}$/.test(path) && request.method === 'GET') {
+        const parts = path.split('/');
+        const roomId = parts[4]!;
+        const attachmentId = parts[6]!;
+        const profile = await verifySession(request, env);
+        const room = env.ROOMS.get(env.ROOMS.idFromName(roomId));
+        const getResp = await room.fetch(new Request(`https://internal/attachments/${attachmentId}?profileId=${profile.profileId}`));
+        if (!getResp.ok) {
+          const failure = await getResp.json() as { code: string };
+          throw new HttpError(getResp.status, failure.code);
+        }
+        response = getResp;
+      } else if (path === '/api/v2/user/settings' && request.method === 'GET') {
+        const profile = await verifySession(request, env);
+        response = await internal(directory(env), `/user/settings?profileId=${profile.profileId}`);
+      } else if (path === '/api/v2/user/settings' && request.method === 'POST') {
+        const profile = await verifySession(request, env), data = await body(request);
+        response = await internal(directory(env), '/user/settings', { profileId: profile.profileId, data });
       } else throw new HttpError(404, 'NOT_FOUND');
       response = new Response(response.body, response);
       for (const [name, value] of Object.entries(cors)) response.headers.set(name, value);

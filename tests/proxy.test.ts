@@ -55,6 +55,7 @@ test('proxy: OPTIONS preflight returns 204 with full CORS headers', async () => 
       assert.ok(exposeHeaders?.includes('Accept-Ranges'));
       assert.ok(exposeHeaders?.includes('ETag'));
       assert.ok(exposeHeaders?.includes('Last-Modified'));
+      assert.ok(exposeHeaders?.includes('X-Upstream-URL'));
     }
   } finally {
     await mf.dispose();
@@ -289,6 +290,184 @@ test('proxy: redirect blocking returns 502 PROXY_REDIRECT_BLOCKED', async () => 
       assert.equal(response.status, 502);
       assert.equal((await response.json()).code, 'PROXY_REDIRECT_BLOCKED');
     }
+  } finally {
+    await mf.dispose();
+  }
+});
+
+test('proxy: follows approved redirects and exposes validated X-Upstream-URL header', async () => {
+  const mf = runtime();
+  try {
+    currentHandler = async req => {
+      const u = new URL(req.url);
+      if (u.hostname === 'video.sibnet.ru') {
+        return new Response(null, {
+          status: 302,
+          headers: { Location: 'https://dv.sibnet.ru/v/123.mp4' },
+        });
+      }
+      if (u.hostname === 'dv.sibnet.ru') {
+        return new Response('mp4-content', {
+          status: 200,
+          headers: { 'Content-Type': 'video/mp4' },
+        });
+      }
+      return new Response('not found', { status: 404 });
+    };
+
+    const response = await mf.dispatchFetch(
+      `http://localhost/corsproxy?url=${encodeURIComponent('https://video.sibnet.ru/shell.php?videoid=123')}`,
+      { headers: { Origin: origin } }
+    );
+    assert.equal(response.status, 200);
+    assert.equal(await response.text(), 'mp4-content');
+    assert.equal(response.headers.get('X-Upstream-URL'), 'https://dv.sibnet.ru/v/123.mp4');
+    assert.ok(response.headers.get('Access-Control-Expose-Headers')?.includes('X-Upstream-URL'));
+  } finally {
+    await mf.dispose();
+  }
+});
+
+test('proxy: security checks block off-list redirects, insecure schemes, credentials, and non-443 ports', async () => {
+  const mf = runtime();
+  try {
+    const maliciousLocations = [
+      'http://dv.sibnet.ru/video.mp4',
+      'https://user:pass@dv.sibnet.ru/video.mp4',
+      'https://dv.sibnet.ru:8443/video.mp4',
+      'https://sub.kodikplayer.com/video.mp4',
+      'https://arbitrary-attacker.org/video.mp4',
+    ];
+
+    for (const loc of maliciousLocations) {
+      currentHandler = async () => new Response(null, {
+        status: 302,
+        headers: { Location: loc },
+      });
+      const response = await mf.dispatchFetch(
+        `http://localhost/corsproxy?url=${encodeURIComponent('https://video.sibnet.ru/test')}`,
+        { headers: { Origin: origin } }
+      );
+      assert.equal(response.status, 502, `Redirect to ${loc} should be blocked`);
+      assert.equal((await response.json()).code, 'PROXY_REDIRECT_BLOCKED');
+    }
+  } finally {
+    await mf.dispose();
+  }
+});
+
+test('proxy: redirect loops and max-hop cutoff (> 5 hops) are blocked with 502 PROXY_REDIRECT_BLOCKED', async () => {
+  const mf = runtime();
+  try {
+    // 1. Loop detection: A -> B -> A
+    currentHandler = async req => {
+      const u = new URL(req.url);
+      if (u.pathname === '/loop-a') {
+        return new Response(null, { status: 302, headers: { Location: 'https://video.sibnet.ru/loop-b' } });
+      }
+      if (u.pathname === '/loop-b') {
+        return new Response(null, { status: 302, headers: { Location: 'https://video.sibnet.ru/loop-a' } });
+      }
+      return new Response('unknown', { status: 404 });
+    };
+    const loopRes = await mf.dispatchFetch(
+      `http://localhost/corsproxy?url=${encodeURIComponent('https://video.sibnet.ru/loop-a')}`,
+      { headers: { Origin: origin } }
+    );
+    assert.equal(loopRes.status, 502);
+    assert.equal((await loopRes.json()).code, 'PROXY_REDIRECT_BLOCKED');
+
+    // 2. Exactly 5 hops succeeds
+    currentHandler = async req => {
+      const u = new URL(req.url);
+      const match = u.pathname.match(/\/hop-(\d+)/);
+      if (match) {
+        const step = Number(match[1]);
+        if (step < 5) {
+          return new Response(null, { status: 302, headers: { Location: `https://video.sibnet.ru/hop-${step + 1}` } });
+        }
+        return new Response('reached 5', { status: 200, headers: { 'Content-Type': 'text/plain' } });
+      }
+      return new Response('bad hop', { status: 404 });
+    };
+    const fiveHopRes = await mf.dispatchFetch(
+      `http://localhost/corsproxy?url=${encodeURIComponent('https://video.sibnet.ru/hop-0')}`,
+      { headers: { Origin: origin } }
+    );
+    assert.equal(fiveHopRes.status, 200);
+    assert.equal(await fiveHopRes.text(), 'reached 5');
+    assert.equal(fiveHopRes.headers.get('X-Upstream-URL'), 'https://video.sibnet.ru/hop-5');
+
+    // 3. 6 hops (> 5 hops) is blocked
+    currentHandler = async req => {
+      const u = new URL(req.url);
+      const match = u.pathname.match(/\/hop-(\d+)/);
+      if (match) {
+        const step = Number(match[1]);
+        if (step < 6) {
+          return new Response(null, { status: 302, headers: { Location: `https://video.sibnet.ru/hop-${step + 1}` } });
+        }
+        return new Response('reached 6', { status: 200 });
+      }
+      return new Response('bad hop', { status: 404 });
+    };
+    const sixHopRes = await mf.dispatchFetch(
+      `http://localhost/corsproxy?url=${encodeURIComponent('https://video.sibnet.ru/hop-0')}`,
+      { headers: { Origin: origin } }
+    );
+    assert.equal(sixHopRes.status, 502);
+    assert.equal((await sixHopRes.json()).code, 'PROXY_REDIRECT_BLOCKED');
+  } finally {
+    await mf.dispose();
+  }
+});
+
+test('proxy: agent POST and cross-host agent redirects are blocked', async () => {
+  const mf = runtime();
+  try {
+    currentHandler = async () => new Response(null, {
+      status: 302,
+      headers: { Location: 'https://api-s.anixsekai.com/redirected' },
+    });
+
+    // POST on /agentproxy receiving redirect must be blocked (no mutation replay)
+    const agentPostRes = await mf.dispatchFetch(
+      `http://localhost/agentproxy?url=${encodeURIComponent('https://api-s.anixsekai.com/action')}`,
+      {
+        method: 'POST',
+        headers: { Origin: origin, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'create' }),
+      }
+    );
+    assert.equal(agentPostRes.status, 502);
+    assert.equal((await agentPostRes.json()).code, 'PROXY_REDIRECT_BLOCKED');
+
+    // POST on /corsproxy receiving redirect must also be blocked
+    const corsPostRes = await mf.dispatchFetch(
+      `http://localhost/corsproxy?url=${encodeURIComponent('https://kodikplayer.com/submit')}`,
+      {
+        method: 'POST',
+        headers: { Origin: origin, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ test: 1 }),
+      }
+    );
+    assert.equal(corsPostRes.status, 502);
+    assert.equal((await corsPostRes.json()).code, 'PROXY_REDIRECT_BLOCKED');
+
+    // GET on /agentproxy attempting cross-host redirect must be blocked
+    currentHandler = async () => new Response(null, {
+      status: 302,
+      headers: { Location: 'https://video.sibnet.ru/profile' },
+    });
+    const agentCrossHostRes = await mf.dispatchFetch(
+      `http://localhost/agentproxy?url=${encodeURIComponent('https://api-s.anixsekai.com/profile')}`,
+      {
+        method: 'GET',
+        headers: { Origin: origin },
+      }
+    );
+    assert.equal(agentCrossHostRes.status, 502);
+    assert.equal((await agentCrossHostRes.json()).code, 'PROXY_REDIRECT_BLOCKED');
   } finally {
     await mf.dispose();
   }

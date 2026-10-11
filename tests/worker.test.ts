@@ -175,3 +175,37 @@ test('real Worker durable alarm: seven-second readiness timeout, manual pause, l
     h.ws.close();
   } finally { await mf.dispose(); }
 });
+
+test('user settings: save and retrieve settings by authenticated profile session', async () => {
+  const mf = runtime();
+  try {
+    const userSession = await login(mf, 42);
+    // 1. Initial get should return 404 SETTINGS_NOT_FOUND
+    const initialGet = await mf.dispatchFetch('http://localhost/api/v2/user/settings', {
+      headers: { Origin: origin, Authorization: `Bearer ${userSession}` }
+    });
+    assert.equal(initialGet.status, 404);
+
+    // 2. Save settings
+    const testPayload = { theme: 'dark', compactMode: true, volume: 80 };
+    const saveRes = await post(mf, '/api/v2/user/settings', testPayload, userSession);
+    assert.equal(saveRes.status, 200);
+    const saveJson = await saveRes.json();
+    assert.equal(saveJson.ok, true);
+
+    // 3. Retrieve settings
+    const getRes = await mf.dispatchFetch('http://localhost/api/v2/user/settings', {
+      headers: { Origin: origin, Authorization: `Bearer ${userSession}` }
+    });
+    assert.equal(getRes.status, 200);
+    const getJson = await getRes.json();
+    assert.equal(getJson.ok, true);
+    assert.deepEqual(getJson.settings, testPayload);
+
+    // 4. Unauthorized request without session returns 401
+    const unauth = await mf.dispatchFetch('http://localhost/api/v2/user/settings', {
+      headers: { Origin: origin }
+    });
+    assert.equal(unauth.status, 401);
+  } finally { await mf.dispose(); }
+});

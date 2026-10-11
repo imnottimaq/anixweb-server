@@ -2,7 +2,13 @@ import type { Profile } from '../protocol/index.ts';
 import { ANIXART_APP_USER_AGENT } from './userAgent.ts';
 
 export class HttpError extends Error {
-  constructor(public readonly status: number, public readonly code: string) { super(code); }
+  readonly status: number;
+  readonly code: string;
+  constructor(status: number, code: string) {
+    super(code);
+    this.status = status;
+    this.code = code;
+  }
 }
 export interface AuthEnv { SESSION_SECRET: string; ANIXART_TEST?: Fetcher }
 const encode = (bytes: Uint8Array) => btoa(String.fromCharCode(...bytes)).replaceAll('+', '-').replaceAll('/', '_').replaceAll('=', '');

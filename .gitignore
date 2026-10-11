@@ -6,3 +6,6 @@ dist/
 !.env.example
 coverage/
 test-results/
+.agentboard/
+logs/
+*.log

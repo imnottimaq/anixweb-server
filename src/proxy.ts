@@ -2,7 +2,56 @@ import { businessLog } from './logging.ts';
 import { ANIXART_APP_USER_AGENT } from './userAgent.ts';
 import type { Env } from './worker.ts';
 
-const ALLOWED_HOSTS = new Set(['kodikplayer.com', 'api-s.anixsekai.com']);
+const ALLOWED_HOSTS = new Set([
+  'kodikplayer.com',
+  'api-s.anixsekai.com',
+  'kodik.info',
+  'kodik.biz',
+  'kodik.cc',
+  'cloud.kodik-storage.com',
+  'video.sibnet.ru',
+  'dv.sibnet.ru',
+  'sibnet.ru',
+  'rutube.ru',
+  'vk.com',
+  'api.vk.com',
+  'oauth.vk.com',
+  'ok.ru',
+  'odnoklassniki.ru',
+  'solodcdn.com',
+  'anilibria.top',
+  'test-streams.mux.dev',
+]);
+
+const APPROVED_REDIRECT_DOMAINS = [
+  'sibnet.ru',
+  'vkuservideo.net',
+  'vkcache.com',
+  'vk-cdn.me',
+  'vkcdn.ru',
+  'mycdn.me',
+  'userapi.com',
+  'vk.com',
+  'ok.ru',
+  'odnoklassniki.ru',
+  'rutube.ru',
+  'kodik-storage.com',
+  'solodcdn.com',
+  'anilibria.top',
+  'test-streams.mux.dev',
+];
+
+function isApprovedRedirectDestination(hostname: string): boolean {
+  if (ALLOWED_HOSTS.has(hostname)) {
+    return true;
+  }
+  for (const domain of APPROVED_REDIRECT_DOMAINS) {
+    if (hostname === domain || hostname.endsWith('.' + domain)) {
+      return true;
+    }
+  }
+  return false;
+}
 const MAX_POST_BODY = 9 * 1024 * 1024; // 9 MiB
 const FORWARD_HEADERS = [
   'accept',
@@ -47,7 +96,7 @@ export async function handleProxyRequest(request: Request, env: Env): Promise<Re
     'Vary': 'Origin',
     'Access-Control-Allow-Methods': 'GET, HEAD, POST, OPTIONS',
     'Access-Control-Allow-Headers': 'Accept, Accept-Language, Content-Type, Api-Version, Range, If-Range, If-None-Match, If-Modified-Since',
-    'Access-Control-Expose-Headers': 'Content-Type, Content-Range, Accept-Ranges, ETag, Last-Modified',
+    'Access-Control-Expose-Headers': 'Content-Type, Content-Range, Accept-Ranges, ETag, Last-Modified, X-Upstream-URL',
   } : {};
 
   if (request.method === 'OPTIONS') {
@@ -199,41 +248,104 @@ export async function handleProxyRequest(request: Request, env: Env): Promise<Re
     signal = AbortSignal.timeout(15_000);
   }
 
-  const upstreamRequest = new Request(targetUrl.toString(), {
-    method: request.method,
-    headers: upstreamHeaders,
-    body: bodyBytes ?? undefined,
-    redirect: 'manual',
-    signal,
-  });
-
+  let currentUrl = targetUrl;
+  let redirectCount = 0;
+  const maxRedirects = 5;
+  const visitedUrls = new Set<string>([currentUrl.toString()]);
   let upstreamResponse: Response;
-  try {
-    const testFetcher = (hostname === 'api-s.anixsekai.com' ? env.ANIXART_TEST : undefined)
-      ?? env.PROXY_TEST
-      ?? (hostname === 'kodikplayer.com' ? env.KODIK_TEST : undefined);
 
-    if (testFetcher) {
-      upstreamResponse = await testFetcher.fetch(upstreamRequest);
-    } else {
-      upstreamResponse = await fetch(upstreamRequest);
-    }
-  } catch (err: unknown) {
-    const errorName = err && typeof err === 'object' && 'name' in err ? (err as { name: string }).name : '';
-    const reasonName = signal.aborted && signal.reason && typeof signal.reason === 'object' && 'name' in signal.reason ? (signal.reason as { name: string }).name : '';
-    if (errorName === 'TimeoutError' || reasonName === 'TimeoutError') {
-      return proxyError(504, 'UPSTREAM_TIMEOUT', proxyCors);
-    }
-    return proxyError(502, 'UPSTREAM_ERROR', proxyCors);
-  }
+  while (true) {
+    const upstreamRequest = new Request(currentUrl.toString(), {
+      method: request.method,
+      headers: upstreamHeaders,
+      body: bodyBytes ?? undefined,
+      redirect: 'manual',
+      signal,
+    });
 
-  // Redirect blocking
-  if (
-    [301, 302, 303, 307, 308].includes(upstreamResponse.status) ||
-    upstreamResponse.headers.has('location') ||
-    (upstreamResponse.type as string) === 'opaqueredirect'
-  ) {
-    return proxyError(502, 'PROXY_REDIRECT_BLOCKED', proxyCors);
+    try {
+      const hopHostname = currentUrl.hostname.toLowerCase();
+      const testFetcher = (hopHostname === 'api-s.anixsekai.com' ? env.ANIXART_TEST : undefined)
+        ?? env.PROXY_TEST
+        ?? (hopHostname === 'kodikplayer.com' ? env.KODIK_TEST : undefined);
+
+      if (testFetcher) {
+        upstreamResponse = await testFetcher.fetch(upstreamRequest);
+      } else {
+        upstreamResponse = await fetch(upstreamRequest);
+      }
+    } catch (err: unknown) {
+      const errorName = err && typeof err === 'object' && 'name' in err ? (err as { name: string }).name : '';
+      const reasonName = signal.aborted && signal.reason && typeof signal.reason === 'object' && 'name' in signal.reason ? (signal.reason as { name: string }).name : '';
+      if (errorName === 'TimeoutError' || reasonName === 'TimeoutError') {
+        return proxyError(504, 'UPSTREAM_TIMEOUT', proxyCors);
+      }
+      return proxyError(502, 'UPSTREAM_ERROR', proxyCors);
+    }
+
+    const isRedirect = [301, 302, 303, 307, 308].includes(upstreamResponse.status) ||
+      (upstreamResponse.type as string) === 'opaqueredirect';
+
+    if (!isRedirect) {
+      break;
+    }
+
+    // Agent / API POST protection: no mutation retries/replays
+    if (request.method === 'POST') {
+      return proxyError(502, 'PROXY_REDIRECT_BLOCKED', proxyCors);
+    }
+
+    if ((upstreamResponse.type as string) === 'opaqueredirect') {
+      return proxyError(502, 'PROXY_REDIRECT_BLOCKED', proxyCors);
+    }
+
+    const locationHeader = upstreamResponse.headers.get('location');
+    if (!locationHeader) {
+      return proxyError(502, 'PROXY_REDIRECT_BLOCKED', proxyCors);
+    }
+
+    redirectCount++;
+    if (redirectCount > maxRedirects) {
+      return proxyError(502, 'PROXY_REDIRECT_BLOCKED', proxyCors);
+    }
+
+    let nextUrl: URL;
+    try {
+      nextUrl = new URL(locationHeader, currentUrl);
+    } catch {
+      return proxyError(502, 'PROXY_REDIRECT_BLOCKED', proxyCors);
+    }
+
+    if (
+      nextUrl.protocol !== 'https:' ||
+      nextUrl.username ||
+      nextUrl.password ||
+      (nextUrl.port !== '' && nextUrl.port !== '443')
+    ) {
+      return proxyError(502, 'PROXY_REDIRECT_BLOCKED', proxyCors);
+    }
+
+    const nextHostname = nextUrl.hostname.toLowerCase();
+    const currentHostname = currentUrl.hostname.toLowerCase();
+
+    // Cross-host agent redirects must stay blocked
+    if (isAgent && nextHostname !== currentHostname) {
+      return proxyError(502, 'PROXY_REDIRECT_BLOCKED', proxyCors);
+    }
+
+    // Approved destination policy
+    if (!isApprovedRedirectDestination(nextHostname)) {
+      return proxyError(502, 'PROXY_REDIRECT_BLOCKED', proxyCors);
+    }
+
+    // Prevent redirect loops
+    const nextUrlStr = nextUrl.toString();
+    if (visitedUrls.has(nextUrlStr)) {
+      return proxyError(502, 'PROXY_REDIRECT_BLOCKED', proxyCors);
+    }
+    visitedUrls.add(nextUrlStr);
+
+    currentUrl = nextUrl;
   }
 
   // Upstream server errors return fixed error codes without leaking details
@@ -253,7 +365,9 @@ export async function handleProxyRequest(request: Request, env: Env): Promise<Re
     }
   }
 
-  if (hostname === 'api-s.anixsekai.com' || isAgent) {
+  responseHeaders.set('X-Upstream-URL', currentUrl.toString());
+
+  if (currentUrl.hostname.toLowerCase() === 'api-s.anixsekai.com' || isAgent) {
     responseHeaders.set('Cache-Control', 'no-store');
   } else {
     const cc = upstreamResponse.headers.get('cache-control');
