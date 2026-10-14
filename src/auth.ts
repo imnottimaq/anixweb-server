@@ -35,20 +35,41 @@ export async function verifySession(request: Request, env: AuthEnv, now = Date.n
     return data.profile;
   } catch { throw new HttpError(401, 'SESSION_INVALID'); }
 }
-export async function authenticate(token: unknown, env: AuthEnv): Promise<Profile> {
+export async function authenticate(token: unknown, profileId: unknown, env: AuthEnv): Promise<Profile> {
   if (typeof token !== 'string' || !token || token.length > 4096) throw new HttpError(400, 'INVALID_TOKEN');
-  const url = new URL('https://api-s.anixsekai.com/profile/info');
+  const candidateId = Number(profileId);
+  if (typeof profileId !== 'number' || !Number.isSafeInteger(candidateId) || candidateId <= 0) throw new HttpError(400, 'INVALID_PROFILE_ID');
+  const url = new URL(`https://api-s.anixsekai.com/profile/${candidateId}`);
   url.searchParams.set('token', token);
   try {
     const request = new Request(url, { headers: { 'User-Agent': ANIXART_APP_USER_AGENT }, signal: AbortSignal.timeout(10_000), redirect: 'manual' });
     const response = env.ANIXART_TEST ? await env.ANIXART_TEST.fetch(request) : await fetch(request);
-    // Do not interpret an upstream outage as invalid credentials.
-    if (!response.ok) throw new HttpError(response.status === 401 ? 401 : 503, response.status === 401 ? 'AUTH_REJECTED' : 'AUTH_UNAVAILABLE');
-    const data = await response.json() as { code?: number; profile?: { id?: unknown; login?: unknown; avatar?: unknown }; id?: unknown; login?: unknown; avatar?: unknown };
-    if (data.code !== undefined && data.code !== 0) throw new HttpError(503, 'AUTH_UNAVAILABLE');
-    const p = data.profile ?? data;
-    const profileId = Number(p.id);
-    if (!Number.isSafeInteger(profileId) || profileId <= 0 || typeof p.login !== 'string' || !p.login.trim() || p.login.length > 100) throw new HttpError(503, 'AUTH_UNAVAILABLE');
-    return { profileId, login: p.login, avatar: typeof p.avatar === 'string' && p.avatar.length > 0 && p.avatar.length <= 2048 ? p.avatar : null };
+    // Explicit HTTP 401 indicates invalid credentials, genuine outage/network error is 503.
+    if (response.status === 401) throw new HttpError(401, 'AUTH_REJECTED');
+    if (!response.ok) throw new HttpError(503, 'AUTH_UNAVAILABLE');
+    const data = await response.json() as {
+      code?: unknown;
+      is_my_profile?: unknown;
+      profile?: { id?: unknown; login?: unknown; avatar?: unknown };
+    };
+    // Safe synthetic invalid token returns HTTP 200 with code 401
+    if (data.code === 401) throw new HttpError(401, 'AUTH_REJECTED');
+    if (data.code !== 0) throw new HttpError(503, 'AUTH_UNAVAILABLE');
+    // Ownership flag is required and must be explicitly true
+    if (data.is_my_profile !== true) throw new HttpError(401, 'AUTH_REJECTED');
+    const p = data.profile;
+    if (!p || typeof p !== 'object') throw new HttpError(503, 'AUTH_UNAVAILABLE');
+    const upstreamId = Number(p.id);
+    if (!Number.isSafeInteger(upstreamId) || upstreamId <= 0 || upstreamId !== candidateId) {
+      throw new HttpError(401, 'AUTH_REJECTED');
+    }
+    if (typeof p.login !== 'string' || !p.login.trim() || p.login.length > 100) {
+      throw new HttpError(503, 'AUTH_UNAVAILABLE');
+    }
+    return {
+      profileId: upstreamId,
+      login: p.login,
+      avatar: typeof p.avatar === 'string' && p.avatar.length > 0 && p.avatar.length <= 2048 ? p.avatar : null,
+    };
   } catch (error) { if (error instanceof HttpError) throw error; throw new HttpError(503, 'AUTH_UNAVAILABLE'); }
 }

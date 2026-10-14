@@ -87,9 +87,18 @@ test('real browser social: host/member exchange messages, live reactions, late j
                             ],
                         });
                     }
-                    const id = Number(url.searchParams.get('token'));
+                    const token = url.searchParams.get('token');
                     if (path === '/profile/info') {
-                        return Response.json({ code: 0, profile: { id, login: `viewer${id}`, avatar: null } });
+                        return Response.json({ code: 0, channel_id: null, privilege_level: 0, rating_score: 0, sponsorship_expires: 0, is_perm_banned: false, is_sponsor: false });
+                    }
+                    if (path.startsWith('/profile/')) {
+                        const profileId = Number(path.replace('/profile/', ''));
+                        const isOwner = token === String(profileId);
+                        return Response.json({
+                            code: 0,
+                            is_my_profile: isOwner,
+                            profile: { id: profileId, login: `viewer${profileId}`, avatar: null }
+                        });
                     }
                     return Response.json({ code: 0, content: [], releases: [], total_page_count: 0 });
                 },
@@ -140,6 +149,7 @@ test('real browser social: host/member exchange messages, live reactions, late j
             await context.addInitScript(({ id }) => {
                 localStorage.setItem('onboarded', 'true');
                 localStorage.setItem('user_id', String(id));
+                localStorage.setItem('user_room_identity', JSON.stringify({ id, login: `viewer${id}`, avatar: null }));
                 localStorage.setItem('app_settings', JSON.stringify({ appearance: { language: 'english', theme: 'light' }, player: { volume: 0, autoplay: false } }));
                 const Socket = window.WebSocket;
                 window.WebSocket = class extends Socket {
@@ -151,18 +161,22 @@ test('real browser social: host/member exchange messages, live reactions, late j
             }, { id });
 
             await context.route('https://api-s.anixsekai.com/**', async route => {
-                const targetUrl = route.request().url();
-                const proxyUrl = `${backend}/corsproxy?url=${encodeURIComponent(targetUrl)}`;
-                const headers = new Headers(route.request().headers());
-                headers.delete('host');
-                headers.set('origin', origin);
-                const response = await fetch(proxyUrl, {
-                    method: route.request().method(),
-                    headers,
-                    body: route.request().postDataBuffer() ?? undefined,
-                });
-                const body = await response.arrayBuffer();
-                await route.fulfill({ status: response.status, headers: Object.fromEntries(response.headers.entries()), body: Buffer.from(body) });
+                try {
+                    const targetUrl = route.request().url();
+                    const proxyUrl = `${backend}/corsproxy?url=${encodeURIComponent(targetUrl)}`;
+                    const headers = new Headers(route.request().headers());
+                    headers.delete('host');
+                    headers.set('origin', origin);
+                    const response = await fetch(proxyUrl, {
+                        method: route.request().method(),
+                        headers,
+                        body: route.request().postDataBuffer() ?? undefined,
+                    });
+                    const body = await response.arrayBuffer();
+                    await route.fulfill({ status: response.status, headers: Object.fromEntries(response.headers.entries()), body: Buffer.from(body) });
+                } catch {
+                    await route.abort().catch(() => {});
+                }
             });
 
             await context.route('https://aniliberty.top/**', route => route.fulfill({

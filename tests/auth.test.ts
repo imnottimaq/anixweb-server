@@ -31,11 +31,32 @@ function runtime(sessionSecret = secret, allowedOrigin = origin) {
     serviceBindings: {
       ANIXART_TEST: async request => {
         assert.equal(request.headers.get('User-Agent'), ANIXART_APP_USER_AGENT);
-        const token = new URL(request.url).searchParams.get('token');
+        const url = new URL(request.url);
+        const path = url.pathname;
+        const token = url.searchParams.get('token');
         if (token === 'outage') return new Response('unavailable', { status: 503 });
+        if (token === 'http401') return new Response('unauthorized', { status: 401 });
+        if (token === 'json401') return Response.json({ code: 401 });
+        if (token === 'upstream_err') return Response.json({ code: 500 });
+        if (token === 'malformed_json') return new Response('{bad json', { status: 200, headers: { 'Content-Type': 'application/json' } });
+        if (path === '/profile/info') {
+          // Realistic production info-only response lacking identity/login/id fields
+          return Response.json({
+            code: 0,
+            channel_id: null,
+            privilege_level: 0,
+            rating_score: 0,
+            sponsorship_expires: 0,
+            is_perm_banned: false,
+            is_sponsor: false,
+          });
+        }
+        const profileId = Number(path.replace('/profile/', ''));
+        const isOwner = token === String(profileId);
         return Response.json({
           code: 0,
-          profile: { id: Number(token), login: token === '4' ? '   ' : `user${token}`, avatar: token === '3' ? '' : null },
+          is_my_profile: isOwner,
+          profile: { id: profileId, login: profileId === 4 ? '   ' : `user${profileId}`, avatar: profileId === 3 ? '' : null },
         });
       },
     },
@@ -55,7 +76,8 @@ function post(mf: Miniflare, path: string, body: unknown, session?: string, cust
 }
 
 async function login(mf: Miniflare, id: number | string) {
-  const response = await post(mf, '/api/v2/session', { token: String(id) });
+  const profileId = Number(id);
+  const response = await post(mf, '/api/v2/session', { token: String(id), profileId: Number.isSafeInteger(profileId) && profileId > 0 ? profileId : 1 });
   assert.equal(response.status, 200);
   return (await response.json() as { session: string }).session;
 }
@@ -262,7 +284,7 @@ test('auth: forbidden or missing Origin is rejected with 403 ORIGIN_FORBIDDEN on
     assert.equal((await evilPostSettings.json() as { code: string }).code, 'ORIGIN_FORBIDDEN');
 
     // 5. Denied Origin on session login
-    const evilSession = await post(mf, '/api/v2/session', { token: '1' }, undefined, evilOrigin);
+    const evilSession = await post(mf, '/api/v2/session', { token: '1', profileId: 1 }, undefined, evilOrigin);
     assert.equal(evilSession.status, 403);
     assert.equal((await evilSession.json() as { code: string }).code, 'ORIGIN_FORBIDDEN');
 
@@ -387,5 +409,151 @@ test('auth: profile spoofing denied - user identity is strictly bound to session
     assert.equal(user1Data.settings.theme, 'evil-spoof');
   } finally {
     await mf.dispose();
+  }
+});
+
+test('auth: candidate profileId validation, ownership verification, and rejection contract', async () => {
+  const mf = runtime();
+  try {
+    // 1. Missing profileId in /api/v2/session -> 400 INVALID_PROFILE_ID
+    const missingProfileId = await post(mf, '/api/v2/session', { token: '1' });
+    assert.equal(missingProfileId.status, 400);
+    assert.equal((await missingProfileId.json() as { code: string }).code, 'INVALID_PROFILE_ID');
+
+    // 2. Non-integer or negative profileId -> 400 INVALID_PROFILE_ID
+    for (const badId of ['1', -5, 0, 1.5, NaN, null, {}]) {
+      const badRes = await post(mf, '/api/v2/session', { token: '1', profileId: badId });
+      assert.equal(badRes.status, 400);
+      assert.equal((await badRes.json() as { code: string }).code, 'INVALID_PROFILE_ID');
+    }
+
+    // 3. User with valid token "1" targets another user profileId 2:
+    // Upstream returns public profile code 0, but is_my_profile is false.
+    // Server MUST reject with 401 AUTH_REJECTED.
+    const targetingOtherId = await post(mf, '/api/v2/session', { token: '1', profileId: 2 });
+    assert.equal(targetingOtherId.status, 401);
+    assert.equal((await targetingOtherId.json() as { code: string }).code, 'AUTH_REJECTED');
+
+    // 4. Upstream returns HTTP 200 with JSON { code: 401 } (synthetic invalid token)
+    // Server MUST classify as 401 AUTH_REJECTED, NOT 503 AUTH_UNAVAILABLE!
+    const json401Res = await post(mf, '/api/v2/session', { token: 'json401', profileId: 1 });
+    assert.equal(json401Res.status, 401);
+    assert.equal((await json401Res.json() as { code: string }).code, 'AUTH_REJECTED');
+
+    // 5. Upstream returns HTTP 401 status
+    // Server MUST classify as 401 AUTH_REJECTED.
+    const http401Res = await post(mf, '/api/v2/session', { token: 'http401', profileId: 1 });
+    assert.equal(http401Res.status, 401);
+    assert.equal((await http401Res.json() as { code: string }).code, 'AUTH_REJECTED');
+
+    // 6. Genuine upstream outage (HTTP 503) returns 503 AUTH_UNAVAILABLE
+    const outageRes = await post(mf, '/api/v2/session', { token: 'outage', profileId: 1 });
+    assert.equal(outageRes.status, 503);
+    assert.equal((await outageRes.json() as { code: string }).code, 'AUTH_UNAVAILABLE');
+
+    // 7. Upstream internal server error code (e.g. code 500) returns 503 AUTH_UNAVAILABLE
+    const upstreamErrRes = await post(mf, '/api/v2/session', { token: 'upstream_err', profileId: 1 });
+    assert.equal(upstreamErrRes.status, 503);
+    assert.equal((await upstreamErrRes.json() as { code: string }).code, 'AUTH_UNAVAILABLE');
+
+    // 8. Malformed upstream JSON returns 503 AUTH_UNAVAILABLE
+    const malformedJsonRes = await post(mf, '/api/v2/session', { token: 'malformed_json', profileId: 1 });
+    assert.equal(malformedJsonRes.status, 503);
+    assert.equal((await malformedJsonRes.json() as { code: string }).code, 'AUTH_UNAVAILABLE');
+  } finally {
+    await mf.dispose();
+  }
+});
+
+test('auth: realistic info-only upstream regression and mismatched profile ID rejection', async () => {
+  // Test runtime with custom service bindings modeling info-only and mismatched profile ID
+  const mfInfo = new Miniflare(convertV4MiniflareOptions({
+    modules: true,
+    script: bundle.outputFiles[0].text,
+    compatibilityDate: '2026-10-07',
+    bindings: { SESSION_SECRET: secret, ALLOWED_ORIGINS: origin },
+    durableObjects: {
+      ROOMS: { className: 'RoomObject', useSQLite: true },
+      DIRECTORY: { className: 'RoomDirectory', useSQLite: true },
+    },
+    serviceBindings: {
+      ANIXART_TEST: async () => {
+        // Realistic /profile/info response that has no profile identity/login
+        return Response.json({
+          code: 0,
+          channel_id: 12345,
+          privilege_level: 1,
+          rating_score: 100,
+          sponsorship_expires: 0,
+          is_perm_banned: false,
+          is_sponsor: false,
+        });
+      },
+    },
+  }));
+  try {
+    // Production /profile/info response lacks ownership flag (is_my_profile is missing/undefined)
+    // Per contract: Missing/false ownership => 401 AUTH_REJECTED.
+    const infoRes = await post(mfInfo, '/api/v2/session', { token: 'my-token', profileId: 10 });
+    assert.equal(infoRes.status, 401);
+    assert.equal((await infoRes.json() as { code: string }).code, 'AUTH_REJECTED');
+  } finally {
+    await mfInfo.dispose();
+  }
+
+  // Test upstream returning bad shape (is_my_profile true but missing profile object) -> 503 AUTH_UNAVAILABLE
+  const mfBadShape = new Miniflare(convertV4MiniflareOptions({
+    modules: true,
+    script: bundle.outputFiles[0].text,
+    compatibilityDate: '2026-10-07',
+    bindings: { SESSION_SECRET: secret, ALLOWED_ORIGINS: origin },
+    durableObjects: {
+      ROOMS: { className: 'RoomObject', useSQLite: true },
+      DIRECTORY: { className: 'RoomDirectory', useSQLite: true },
+    },
+    serviceBindings: {
+      ANIXART_TEST: async () => {
+        return Response.json({
+          code: 0,
+          is_my_profile: true,
+          profile: null,
+        });
+      },
+    },
+  }));
+  try {
+    const badShapeRes = await post(mfBadShape, '/api/v2/session', { token: 'my-token', profileId: 10 });
+    assert.equal(badShapeRes.status, 503);
+    assert.equal((await badShapeRes.json() as { code: string }).code, 'AUTH_UNAVAILABLE');
+  } finally {
+    await mfBadShape.dispose();
+  }
+
+  // Test upstream returning profile with mismatched ID even if is_my_profile is true
+  const mfMismatch = new Miniflare(convertV4MiniflareOptions({
+    modules: true,
+    script: bundle.outputFiles[0].text,
+    compatibilityDate: '2026-10-07',
+    bindings: { SESSION_SECRET: secret, ALLOWED_ORIGINS: origin },
+    durableObjects: {
+      ROOMS: { className: 'RoomObject', useSQLite: true },
+      DIRECTORY: { className: 'RoomDirectory', useSQLite: true },
+    },
+    serviceBindings: {
+      ANIXART_TEST: async () => {
+        return Response.json({
+          code: 0,
+          is_my_profile: true,
+          profile: { id: 999, login: 'user999', avatar: null }, // Mismatched from candidateId 10
+        });
+      },
+    },
+  }));
+  try {
+    const mismatchRes = await post(mfMismatch, '/api/v2/session', { token: 'my-token', profileId: 10 });
+    assert.equal(mismatchRes.status, 401);
+    assert.equal((await mismatchRes.json() as { code: string }).code, 'AUTH_REJECTED');
+  } finally {
+    await mfMismatch.dispose();
   }
 });

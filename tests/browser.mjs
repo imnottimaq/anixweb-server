@@ -86,9 +86,18 @@ test('two real browsers: seven-second wait, late catch-up, room controls, naviga
                         { position: 2, name: 'Second episode', url: 'https://aniliberty.top/?id=1&ep=2' },
                     ] });
                 }
-                const id = Number(url.searchParams.get('token'));
+                const token = url.searchParams.get('token');
                 if (path === '/profile/info') {
-                    return Response.json({ code: 0, profile: { id, login: `viewer${id}`, avatar: null } });
+                    return Response.json({ code: 0, channel_id: null, privilege_level: 0, rating_score: 0, sponsorship_expires: 0, is_perm_banned: false, is_sponsor: false });
+                }
+                if (path.startsWith('/profile/')) {
+                    const profileId = Number(path.replace('/profile/', ''));
+                    const isOwner = token === String(profileId);
+                    return Response.json({
+                        code: 0,
+                        is_my_profile: isOwner,
+                        profile: { id: profileId, login: `viewer${profileId}`, avatar: null }
+                    });
                 }
                 return Response.json({ code: 0, content: [], releases: [], total_page_count: 0 });
             } },
@@ -134,6 +143,7 @@ test('two real browsers: seven-second wait, late catch-up, room controls, naviga
             await context.addCookies([{ name: 'anixart_token', value: String(id), url: origin }]);
             await context.addInitScript(({ id }) => {
                 localStorage.setItem('onboarded', 'true'); localStorage.setItem('user_id', String(id));
+                localStorage.setItem('user_room_identity', JSON.stringify({ id, login: `viewer${id}`, avatar: null }));
                 localStorage.setItem('app_settings', JSON.stringify({ appearance: { language: 'english' }, player: { volume: 0, autoplay: false } }));
                 // Observability only: these are real native WebSocket instances.
                 const Socket = window.WebSocket;

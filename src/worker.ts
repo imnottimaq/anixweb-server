@@ -52,7 +52,8 @@ export default {
       let response: Response;
       if (path === '/api/v2/session' && request.method === 'POST') {
         await internal(directory(env), '/limit', { key: `auth:${request.headers.get('CF-Connecting-IP') ?? 'local'}`, max: 30 });
-        response = json(await signSession(await authenticate((await body(request)).token, env), env));
+        const data = await body(request);
+        response = json(await signSession(await authenticate(data.token, data.profileId, env), env));
       } else if (path === '/api/v2/rooms' && request.method === 'GET') {
         response = await internal(directory(env), `/list?cursor=${encodeURIComponent(url.searchParams.get('cursor') ?? '')}`);
       } else if (path === '/api/v2/rooms' && request.method === 'POST') {

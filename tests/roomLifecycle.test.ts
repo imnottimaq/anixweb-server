@@ -23,11 +23,16 @@ function runtime() {
     serviceBindings: {
       ANIXART_TEST: async request => {
         assert.equal(request.headers.get('User-Agent'), ANIXART_APP_USER_AGENT);
-        const token = new URL(request.url).searchParams.get('token');
+        const url = new URL(request.url);
+        const path = url.pathname;
+        const token = url.searchParams.get('token');
         if (token === 'outage') return new Response('unavailable', { status: 503 });
+        const profileId = Number(path.replace('/profile/', ''));
+        const isOwner = token === String(profileId);
         return Response.json({
           code: 0,
-          profile: { id: Number(token), login: `user${token}`, avatar: null },
+          is_my_profile: isOwner,
+          profile: { id: profileId, login: `user${profileId}`, avatar: null },
         });
       },
     },
@@ -47,7 +52,8 @@ function post(mf: Miniflare, path: string, body: unknown, session?: string) {
 }
 
 async function login(mf: Miniflare, id: number | string) {
-  const response = await post(mf, '/api/v2/session', { token: String(id) });
+  const profileId = Number(id);
+  const response = await post(mf, '/api/v2/session', { token: String(id), profileId: Number.isSafeInteger(profileId) && profileId > 0 ? profileId : 1 });
   assert.equal(response.status, 200);
   return (await response.json() as { session: string }).session;
 }

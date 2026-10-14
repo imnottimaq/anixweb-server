@@ -87,9 +87,18 @@ test('real browser attachments: native image and voice delivery, history, host c
                             ],
                         });
                     }
-                    const id = Number(url.searchParams.get('token'));
+                    const token = url.searchParams.get('token');
                     if (path === '/profile/info') {
-                        return Response.json({ code: 0, profile: { id, login: `viewer${id}`, avatar: null } });
+                        return Response.json({ code: 0, channel_id: null, privilege_level: 0, rating_score: 0, sponsorship_expires: 0, is_perm_banned: false, is_sponsor: false });
+                    }
+                    if (path.startsWith('/profile/')) {
+                        const profileId = Number(path.replace('/profile/', ''));
+                        const isOwner = token === String(profileId);
+                        return Response.json({
+                            code: 0,
+                            is_my_profile: isOwner,
+                            profile: { id: profileId, login: `viewer${profileId}`, avatar: null }
+                        });
                     }
                     return Response.json({ code: 0, content: [], releases: [], total_page_count: 0 });
                 },
@@ -140,6 +149,7 @@ test('real browser attachments: native image and voice delivery, history, host c
             await context.addInitScript(({ id }) => {
                 localStorage.setItem('onboarded', 'true');
                 localStorage.setItem('user_id', String(id));
+                localStorage.setItem('user_room_identity', JSON.stringify({ id, login: `viewer${id}`, avatar: null }));
                 localStorage.setItem('app_settings', JSON.stringify({ appearance: { language: 'english', theme: 'light' }, player: { volume: 0, autoplay: false } }));
                 const Socket = window.WebSocket;
                 window.WebSocket = class extends Socket {
@@ -252,14 +262,14 @@ test('real browser attachments: native image and voice delivery, history, host c
         await g.page.getByRole('log').scrollIntoViewIfNeeded();
         await mkdir(join(clientRoot, 'test-results'), {recursive: true});
         await g.page.screenshot({path: join(clientRoot, 'test-results', 'watch-room-attachments.png')});
-        const sessionResponse = await fetch(`${backend}/api/v2/session`, {method: 'POST', headers: {'content-type':'application/json', origin}, body: JSON.stringify({token:'1'})});
+        const sessionResponse = await fetch(`${backend}/api/v2/session`, {method: 'POST', headers: {'content-type':'application/json', origin}, body: JSON.stringify({token:'1', profileId: 1})});
         assert.equal(sessionResponse.status, 200);
         const session = await sessionResponse.json();
         const auth = {authorization: `Bearer ${session.session}`, origin};
         const imageUrl = `${backend}/api/v2/rooms/${roomId}/attachments/${imageMessage.attachment.id}`;
         assert.equal((await fetch(imageUrl, {headers:auth})).status, 200);
         assert.equal((await fetch(imageUrl, {headers:{origin}})).status, 401, 'anonymous files are private');
-        const outsiderSession = await (await fetch(`${backend}/api/v2/session`, {method:'POST', headers:{'content-type':'application/json',origin}, body:JSON.stringify({token:'99'})})).json();
+        const outsiderSession = await (await fetch(`${backend}/api/v2/session`, {method:'POST', headers:{'content-type':'application/json',origin}, body:JSON.stringify({token:'99', profileId: 99})})).json();
         assert.equal((await fetch(imageUrl, {headers:{authorization:`Bearer ${outsiderSession.session}`,origin}})).status, 403, 'unjoined account cannot fetch files');
         assert.equal((await fetch(`${backend}/api/v2/rooms/${roomId}/attachments`, {method:'POST', headers:{...auth, 'content-type':'image/svg+xml','X-Attachment-Kind':'image','X-Attachment-Name':'unsafe.svg','X-Attachment-Upload-Id':crypto.randomUUID()},body:'<svg xmlns="http://www.w3.org/2000/svg" />'})).status, 415, 'active image format rejected');
         const maxImage = Buffer.alloc(5_000_000); Buffer.from(png,'base64').copy(maxImage);

@@ -13,9 +13,20 @@ function runtime(secret = 'integration-secret-at-least-thirty-two-characters') {
     durableObjects: { ROOMS: { className: 'RoomObject', useSQLite: true }, DIRECTORY: { className: 'RoomDirectory', useSQLite: true } },
     serviceBindings: { ANIXART_TEST: async request => {
       assert.equal(request.headers.get('User-Agent'), ANIXART_APP_USER_AGENT);
-      const token = new URL(request.url).searchParams.get('token');
+      const url = new URL(request.url);
+      const path = url.pathname;
+      const token = url.searchParams.get('token');
       if (token === 'outage') return new Response('unavailable', { status: 503 });
-      return Response.json({ code: 0, profile: { id: Number(token), login: token === '4' ? '   ' : `user${token}`, avatar: token === '3' ? '' : null } });
+      if (path === '/profile/info') {
+        return Response.json({ code: 0, channel_id: null, privilege_level: 0, rating_score: 0, sponsorship_expires: 0, is_perm_banned: false, is_sponsor: false });
+      }
+      const profileId = Number(path.replace('/profile/', ''));
+      const isOwner = token === String(profileId);
+      return Response.json({
+        code: 0,
+        is_my_profile: isOwner,
+        profile: { id: profileId, login: profileId === 4 ? '   ' : `user${profileId}`, avatar: profileId === 3 ? '' : null },
+      });
     } },
   }));
 }
@@ -23,7 +34,8 @@ function post(mf, path, body, session) {
   return mf.dispatchFetch(`http://localhost${path}`, { method: 'POST', headers: { Origin: origin, 'Content-Type': 'application/json', ...(session ? { Authorization: `Bearer ${session}` } : {}) }, body: JSON.stringify(body) });
 }
 async function login(mf, id) {
-  const response = await post(mf, '/api/v2/session', { token: String(id) });
+  const profileId = Number(id);
+  const response = await post(mf, '/api/v2/session', { token: String(id), profileId: Number.isSafeInteger(profileId) && profileId > 0 ? profileId : 1 });
   assert.equal(response.status, 200); return (await response.json()).session;
 }
 async function socket(mf, roomId, ticket) {
@@ -109,11 +121,15 @@ test('real Worker: public list, invalid authentication, origin rejection, outage
   const mf = runtime();
   try {
     assert.equal((await post(mf, '/api/v2/rooms', { title: 'Test', visibility: 'public' })).status, 401);
-    assert.equal((await post(mf, '/api/v2/session', { token: 'outage' })).status, 503);
-    assert.equal((await (await post(mf, '/api/v2/session', { token: '3' })).json()).profile.avatar, null);
-    assert.equal((await post(mf, '/api/v2/session', { token: '4' })).status, 503);
-    assert.equal((await post(mf, '/api/v2/session', { token: 'x'.repeat(9000) })).status, 413);
-    assert.equal((await post(mf, '/api/v2/session', { token: 'я'.repeat(4500) })).status, 413);
+    assert.equal((await post(mf, '/api/v2/session', { token: 'outage', profileId: 1 })).status, 503);
+    assert.equal((await (await post(mf, '/api/v2/session', { token: '3', profileId: 3 })).json()).profile.avatar, null);
+    assert.equal((await post(mf, '/api/v2/session', { token: '4', profileId: 4 })).status, 503);
+    assert.equal((await post(mf, '/api/v2/session', { token: 'x'.repeat(9000), profileId: 1 })).status, 413);
+    assert.equal((await post(mf, '/api/v2/session', { token: 'я'.repeat(4500), profileId: 1 })).status, 413);
+    // Missing profileId rejected with 400
+    assert.equal((await post(mf, '/api/v2/session', { token: '1' })).status, 400);
+    // Token targeting another ID rejected with 401
+    assert.equal((await post(mf, '/api/v2/session', { token: '1', profileId: 2 })).status, 401);
     assert.equal((await mf.dispatchFetch('http://localhost/api/v2/rooms', { headers: { Origin: 'https://evil.example' } })).status, 403);
     const host = await login(mf, 1);
     const exploit = await post(mf, '/api/v2/rooms', { title: 'Exploit', visibility: ['private'] }, host);
@@ -129,7 +145,7 @@ test('real Worker: public list, invalid authentication, origin rejection, outage
     assert.equal((await post(mf, '/api/v2/rooms', { title: 'Public', visibility: 'public' }, host)).status, 429);
   } finally { await mf.dispose(); }
   const unconfigured = runtime('');
-  try { assert.equal((await post(unconfigured, '/api/v2/session', { token: '1' })).status, 503); }
+  try { assert.equal((await post(unconfigured, '/api/v2/session', { token: '1', profileId: 1 })).status, 503); }
   finally { await unconfigured.dispose(); }
 });
 
